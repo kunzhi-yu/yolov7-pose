@@ -139,12 +139,22 @@ def return_frame(anonymize=True, device='0', min_area=4000, thresh_val=40, yolo_
                 elif not any(is_motion_lst) and not is_motion and out is not None:
                     out.release()
 
-                (flag, encodedImage) = cv2.imencode(".jpg", processed_frame.get_frame) # encode frame in JPEG format
-                if not flag:  # ensure the frame was successfully encoded
+                # Should we reset the background?
+                is_person_lst = [f.get_num_detections for f in buffer_lst]
+                if static_count == fps * 10 and sum(is_person_lst) == 0:
+                    init_background_grey = background_sub_frame_prep(letterbox(cap_frame, stride=64, auto=True)[0])
+                    static_count = 0
+
+                # Stream the frame
+                flag, encoded_image = cv2.imencode(".jpg", processed_frame.get_processed_frame)
+                if not flag:
                     continue
 
                 # update buffer
                 buffered_frames.append(processed_frame)
+
+                # update the previous frame
+                prev_grey_frame = curr_grey_frame
 
                 # FPS calculations
                 end_time = time.time()
