@@ -3,7 +3,6 @@ import collections
 import time
 from datetime import datetime
 import pandas as pd
-import threading
 import flask
 from flask import Response, Flask, render_template
 
@@ -23,11 +22,9 @@ from utils.torch_utils import select_device
 """
 Perform initializations
 """
-lock = threading.Lock()  # to prevent race condition; in this case, it ensures that one thread isn't trying to read the frame as it is being updated.
 app = Flask(__name__)  # initialize a flask object
 cap = cv2.VideoCapture(0)  # so that we can use the webcam
 time.sleep(5.0)  # wait for the camera to warm up. Changed to 5 seconds as it looks like it takes a while for the camera to turn on.
-
 
 def return_frame(anonymize=True, device='0', min_area=4000, thresh_val=40, yolo_conf=0.4):
     # grab global references to the video stream, output frame, and lock variables.
@@ -38,7 +35,7 @@ def return_frame(anonymize=True, device='0', min_area=4000, thresh_val=40, yolo_
     _ = model.eval()
     names = model.module.names if hasattr(model, 'module') else model.names
 
-    global cap, lock
+    global cap
 
     if not cap.isOpened():  # check if videocapture not opened
         print('Error while trying to read video. Please check path again')
@@ -76,82 +73,81 @@ def return_frame(anonymize=True, device='0', min_area=4000, thresh_val=40, yolo_
 
     try:
         while cap.isOpened:
-            with lock:  # wait until the lock is acquired. We need to acquire the lock to ensure the frame variable is not accidentally being read by a client while we are trying to update it.
-                success, cap_frame = cap.read()  # read the camera frame
-                if not success:
-                    break
+            success, cap_frame = cap.read()  # read the camera frame
+            if not success:
+                break
 
-                print("Frame {} Processing".format(frame_count + 1))
-                fps_start_time = time.time()  # start time for fps calculation
+            print("Frame {} Processing".format(frame_count + 1))
+            fps_start_time = time.time()  # start time for fps calculation
 
-                # Background subtraction and YOLO frame prep
-                curr_grey_frame = background_sub_frame_prep(cap_frame)
-                curr_frame = yolo_frame_prep(device, cap_frame)
+            # Background subtraction and YOLO frame prep
+            curr_grey_frame = background_sub_frame_prep(cap_frame)
+            curr_frame = yolo_frame_prep(device, cap_frame)
 
-                if anonymize:
-                    im0 = init_background.copy()
-                else:
-                    # The background will be the current frame
-                    im0 = curr_frame[0].permute(1, 2, 0) * 255  # Change format [b, c, h, w] to [h, w, c]
-                    im0 = im0.cpu().numpy().astype(np.uint8)
-                    im0 = cv2.cvtColor(im0, cv2.COLOR_RGB2BGR)  # reshape image format to (BGR)
+            if anonymize:
+                im0 = init_background.copy()
+            else:
+                # The background will be the current frame
+                im0 = curr_frame[0].permute(1, 2, 0) * 255  # Change format [b, c, h, w] to [h, w, c]
+                im0 = im0.cpu().numpy().astype(np.uint8)
+                im0 = cv2.cvtColor(im0, cv2.COLOR_RGB2BGR)  # reshape image format to (BGR)
 
-                # Perform background subtraction
-                processed_frame, static_count = run_background_sub(init_background_grey, curr_grey_frame,
-                                                                       prev_grey_frame, static_count, im0)
-                is_motion = processed_frame.get_is_motion
+            # Perform background subtraction
+            processed_frame, static_count = run_background_sub(init_background_grey, curr_grey_frame,
+                                                                   prev_grey_frame, static_count, im0)
+            is_motion = processed_frame.get_is_motion
 
-                if is_motion:
-                    # Perform YOLO. Get predictions using model
-                    with torch.no_grad():
-                        output_data, _ = model(curr_frame)
+            if is_motion:
+                # Perform YOLO. Get predictions using model
+                with torch.no_grad():
+                    output_data, _ = model(curr_frame)
 
-                    # Specifying model parameters using non max suppression
-                    output_data = non_max_suppression_kpt(output_data,
-                                                          opt.yolo_conf,  # Conf. Threshold.
-                                                          0.4,  # IoU Threshold.
-                                                          nc=model.yaml['nc'],  # Number of classes.
-                                                          nkpt=model.yaml['nkpt'],  # Number of keypoints.
-                                                          kpt_label=True)
+                # Specifying model parameters using non max suppression
+                output_data = non_max_suppression_kpt(output_data,
+                                                      opt.yolo_conf,  # Conf. Threshold.
+                                                      0.4,  # IoU Threshold.
+                                                      nc=model.yaml['nc'],  # Number of classes.
+                                                      nkpt=model.yaml['nkpt'],  # Number of keypoints.
+                                                      kpt_label=True)
 
-                    # Place the model outputs onto an frame
-                    processed_frame = yolo_output_plotter(processed_frame.get_frame, names, output_data)
+                # Place the model outputs onto an frame
+                processed_frame = yolo_output_plotter(processed_frame.get_frame, names, output_data)
 
-                date_time = place_txt_results(processed_frame.get_bed_occupied, is_motion,
-                                              processed_frame.get_num_detections,
-                                              processed_frame.get_frame)
+            date_time = place_txt_results(processed_frame.get_bed_occupied, is_motion,
+                                          processed_frame.get_num_detections,
+                                          processed_frame.get_frame)
 
-                update_df(processed_frame.get_bed_occupied, date_time, df, is_motion,
-                          processed_frame.get_num_detections, frame_count, fps)
+            update_df(processed_frame.get_bed_occupied, date_time, df, is_motion,
+                      processed_frame.get_num_detections, frame_count, fps)
 
-                # Figure out how to save the frame based off buffer
-                buffer_lst = list(buffered_frames)
-                is_motion_lst = [f.get_is_motion for f in buffer_lst]
-                if not any(is_motion_lst) and is_motion:
-                    curr_time = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
-                    out = cv2.VideoWriter(f"output_videos/{curr_time}.mp4",
-                                          cv2.VideoWriter_fourcc(*'mp4v'), fps, (resize_width, resize_height))
-                    for f in buffer_lst:
-                        out.write(f.get_frame)
-                    out.write(processed_frame.get_frame)
-                elif any(is_motion_lst) and out is not None:
-                    out.write(processed_frame.get_frame)
-                elif not any(is_motion_lst) and not is_motion and out is not None:
-                    out.release()
+            # Figure out how to save the frame based off buffer
+            buffer_lst = list(buffered_frames)
+            is_motion_lst = [f.get_is_motion for f in buffer_lst]
+            if not any(is_motion_lst) and is_motion:
+                curr_time = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
+                out = cv2.VideoWriter(f"output_videos/{curr_time}.mp4",
+                                      cv2.VideoWriter_fourcc(*'mp4v'), fps, (resize_width, resize_height))
+                for f in buffer_lst:
+                    out.write(f.get_frame)
+                out.write(processed_frame.get_frame)
+            elif any(is_motion_lst) and out is not None:
+                out.write(processed_frame.get_frame)
+            elif not any(is_motion_lst) and not is_motion and out is not None:
+                out.release()
 
-                (flag, encodedImage) = cv2.imencode(".jpg", processed_frame.get_frame) # encode frame in JPEG format
-                if not flag:  # ensure the frame was successfully encoded
-                    continue
+            (flag, encodedImage) = cv2.imencode(".jpg", processed_frame.get_frame) # encode frame in JPEG format
+            if not flag:  # ensure the frame was successfully encoded
+                continue
 
-                # update buffer
-                buffered_frames.append(processed_frame)
+            # update buffer
+            buffered_frames.append(processed_frame)
 
-                # FPS calculations
-                end_time = time.time()
-                total_fps += 1 / (end_time - fps_start_time)
-                frame_count += 1
+            # FPS calculations
+            end_time = time.time()
+            total_fps += 1 / (end_time - fps_start_time)
+            frame_count += 1
 
-                time.sleep((1 / fps) - ((time.monotonic() - start_time) % (1 / fps)))
+            time.sleep((1 / fps) - ((time.monotonic() - start_time) % (1 / fps)))
 
             yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + bytearray(
                 encodedImage) + b'\r\n')  # yield some text and the output frame in the byte format
@@ -311,12 +307,6 @@ def parse_opt():
 if __name__ == '__main__':
     opt = parse_opt()
     strip_optimizer(opt.device)
-    
-    # start a thread that will perform motion detection
-    t = threading.Thread(target=return_frame, args=[opt.anonymize, opt.device, opt.min_area, opt.thresh_val, opt.yolo_conf])
-    t.daemon = True
-    t.start()
-    t.join()
 
     # start the flask app
     app.run(host='10.42.0.1', port=opt.port, debug=True, threaded=True, use_reloader=False)
