@@ -122,8 +122,8 @@ def run(source=0, anonymize=True, device='cpu', min_area=2000, thresh_val=40, yo
                 # Figure out how to save the frame based off buffer
                 buffer_lst = list(buffered_frames)
                 is_motion_lst = [f.get_is_motion for f in buffer_lst]
+                curr_time = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
                 if not any(is_motion_lst) and is_motion:
-                    curr_time = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
                     out_video_name = f"{source.split('/')[-1].split('.')[0]}"
                     out = cv2.VideoWriter(f"output_videos/{out_video_name}_{curr_time}.mp4",
                                           cv2.VideoWriter_fourcc(*'mp4v'), fps, (resize_width, resize_height))
@@ -134,6 +134,15 @@ def run(source=0, anonymize=True, device='cpu', min_area=2000, thresh_val=40, yo
                     out.write(processed_frame.get_frame)
                 elif not any(is_motion_lst) and not is_motion and out is not None:
                     out.release()
+                # backup csv file every 5 minutes
+                if frame_count % (300 * fps) == 0:
+                    df.to_csv(f"output_videos/backup.csv", index=False)
+                    # break videos into 20 minute pieces
+                    if frame_count % (1800 * fps) == 0 and out is not None:
+                        out.release()
+                        out_video_name = f"{source.split('/')[-1].split('.')[0]}"
+                        out = cv2.VideoWriter(f"output_videos/{out_video_name}_{curr_time}.mp4",
+                                              cv2.VideoWriter_fourcc(*'mp4v'), fps, (resize_width, resize_height))
 
                 # update buffer
                 buffered_frames.append(processed_frame)
