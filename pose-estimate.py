@@ -1,5 +1,6 @@
 import argparse
 import collections
+import threading
 import time
 from datetime import datetime
 import pandas as pd
@@ -8,6 +9,7 @@ import cv2
 import imutils
 import numpy as np
 import torch
+from flask import render_template, Response, Flask
 
 from models.experimental import attempt_load
 from utils import frame
@@ -17,9 +19,12 @@ from utils.general import non_max_suppression_kpt, strip_optimizer
 from utils.plots import colors, plot_one_box_kpt
 from utils.torch_utils import select_device
 
+import signal
+import sys
+
 
 @torch.no_grad()
-def run(source=0, anonymize=True, device='cpu', min_area=2000, thresh_val=40, yolo_conf=0.4,
+def run(lock, cap, anonymize=False, device='cpu', min_area=2000, thresh_val=40, yolo_conf=0.4,
         save_conf=False, line_thickness=3, hide_labels=False, hide_conf=True):
     """
     Saves mp4 result of YOLOv7 pose model and background subtraction. Main function that reads the input video
@@ -32,52 +37,45 @@ def run(source=0, anonymize=True, device='cpu', min_area=2000, thresh_val=40, yo
     _ = model.eval()
     names = model.module.names if hasattr(model, 'module') else model.names
 
-    cap = cv2.VideoCapture(int(source))
-    time.sleep(5.0)  # Wait for camera to turn on
+    # initiate dataframe
+    df = pd.DataFrame(columns=['date', 'time', 'motion', 'yolo_detections', 'bed_occupied'])
 
-    if not cap.isOpened():  # check if videocapture not opened
-        print('Error while trying to read video. Please check path again')
-        raise SystemExit()
+    # Frame calculations
+    frame_count = 0
+    total_fps = 0
+    # fps = int(cap.get(cv2.CAP_PROP_FPS))
+    fps = 3
+    starttime = time.monotonic()
 
-    else:
-        # initiate dataframe
-        df = pd.DataFrame(columns=['date', 'time', 'motion', 'yolo_detections', 'bed_occupied'])
+    # Extract resizing details based of first frame
+    init_background = letterbox(cap.read()[1], stride=64, auto=True)[0]
+    resize_height, resize_width = init_background.shape[:2]
 
-        # Frame calculations
-        frame_count = 0
-        total_fps = 0
-        # fps = int(cap.get(cv2.CAP_PROP_FPS))
-        fps = 3
-        starttime = time.monotonic()
+    # Initialize video writer
+    out = None
 
-        # Extract resizing details based of first frame
-        init_background = letterbox(cap.read()[1], stride=64, auto=True)[0]
-        resize_height, resize_width = init_background.shape[:2]
+    # Initialize video buffer for when there is no motion
+    buffer_seconds = 5
+    buffered_frames = collections.deque([], (fps * buffer_seconds))
 
-        # Initialize video writer
-        out = None
+    # Initialize counter for duration since last change
+    static_count = 0
 
-        # Initialize video buffer for when there is no motion
-        buffer_seconds = 5
-        buffered_frames = collections.deque([], (fps * buffer_seconds))
+    # Initialize background subtraction by storing first frame to compare
+    init_background_grey = background_sub_frame_prep(init_background)
+    prev_grey_frame = init_background_grey.copy()
 
-        # Initialize counter for duration since last change
-        static_count = 0
-
-        # Initialize background subtraction by storing first frame to compare
-        init_background_grey = background_sub_frame_prep(init_background)
-        prev_grey_frame = init_background_grey.copy()
-
-        try:
-            while cap.isOpened:
-                ret, cap_frame = cap.read()  # get frame and success from video capture
-
-                # exit if failed to get frame
-                if not ret:
+    try:
+        while cap.isOpened:
+            with lock:
+                success, cap_frame = cap.read()
+                if not success or ctrl_c_pressed:
                     break
 
                 print("Frame {} Processing".format(frame_count + 1))
-                fps_start_time = time.time()  # start time for fps calculation
+
+                # start time for fps calculation
+                fps_start_time = time.time()
 
                 # Background subtraction and YOLO frame prep
                 curr_grey_frame = background_sub_frame_prep(cap_frame)
@@ -100,8 +98,7 @@ def run(source=0, anonymize=True, device='cpu', min_area=2000, thresh_val=40, yo
                     # Perform YOLO. Get predictions using model
                     with torch.no_grad():
                         output_data, _ = model(curr_frame)
-
-                    # Specifying model parameters using non max suppression
+                    # Specifying model parameters using non-max suppression
                     output_data = non_max_suppression_kpt(output_data,
                                                           opt.yolo_conf,  # Conf. Threshold.
                                                           0.4,  # IoU Threshold.
@@ -109,7 +106,7 @@ def run(source=0, anonymize=True, device='cpu', min_area=2000, thresh_val=40, yo
                                                           nkpt=model.yaml['nkpt'],  # Number of keypoints.
                                                           kpt_label=True)
 
-                    # Place the model outputs onto an frame
+                    # Place the model outputs onto a frame
                     processed_frame = yolo_output_plotter(processed_frame.get_frame, names, output_data)
 
                 date_time = place_txt_results(processed_frame.get_bed_occupied, is_motion,
@@ -124,8 +121,7 @@ def run(source=0, anonymize=True, device='cpu', min_area=2000, thresh_val=40, yo
                 is_motion_lst = [f.get_is_motion for f in buffer_lst]
                 curr_time = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
                 if not any(is_motion_lst) and is_motion:
-                    out_video_name = f"{source.split('/')[-1].split('.')[0]}"
-                    out = cv2.VideoWriter(f"output_videos/{out_video_name}_{curr_time}.mp4",
+                    out = cv2.VideoWriter(f"output_videos/{curr_time}.mp4",
                                           cv2.VideoWriter_fourcc(*'mp4v'), fps, (resize_width, resize_height))
                     for f in buffer_lst:
                         out.write(f.get_frame)
@@ -134,15 +130,21 @@ def run(source=0, anonymize=True, device='cpu', min_area=2000, thresh_val=40, yo
                     out.write(processed_frame.get_frame)
                 elif not any(is_motion_lst) and not is_motion and out is not None:
                     out.release()
-                # backup csv file every 5 minutes
-                if frame_count % (300 * fps) == 0:
+
+                # backup csv file every ~5 minutes
+                if (frame_count + 1) % (300 * fps) == 0:
                     df.to_csv(f"output_videos/backup.csv", index=False)
-                    # break videos into 20 minute pieces
+                    print("Back up CSV")
+                    # break videos into 30 minute pieces
                     if frame_count % (1800 * fps) == 0 and out is not None:
                         out.release()
-                        out_video_name = f"{source.split('/')[-1].split('.')[0]}"
-                        out = cv2.VideoWriter(f"output_videos/{out_video_name}_{curr_time}.mp4",
+                        out = cv2.VideoWriter(f"output_videos/{curr_time}.mp4",
                                               cv2.VideoWriter_fourcc(*'mp4v'), fps, (resize_width, resize_height))
+                        print("Back up Video")
+
+                (flag, encodedImage) = cv2.imencode(".jpg", processed_frame.get_frame)
+                if not flag:
+                    continue
 
                 # update buffer
                 buffered_frames.append(processed_frame)
@@ -154,16 +156,23 @@ def run(source=0, anonymize=True, device='cpu', min_area=2000, thresh_val=40, yo
                 end_time = time.time()
                 total_fps += 1 / (end_time - fps_start_time)
                 frame_count += 1
-
                 time.sleep((1 / fps) - ((time.monotonic() - starttime) % (1 / fps)))
 
-        except KeyboardInterrupt:
-            pass
+            frame_bytes = b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + bytearray(encodedImage) + b'\r\n'
+            app.cur_frame = frame_bytes
 
-        cap.release()
-        curr_time = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
-        df.to_csv(f"output_videos/{curr_time}.csv", index=False)
-        print(f"Average FPS: {total_fps / frame_count:.3f}")
+    finally:
+        finish_video_df(cap, df, frame_count, out, total_fps)
+
+
+def finish_video_df(cap, df, frame_count, out, total_fps):
+    """Releases resources and saves any running video and csv files.
+    """
+    cap.release()
+    out.release()
+    curr_time = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
+    df.to_csv(f"output_videos/{curr_time}.csv", index=False)
+    print(f"Average FPS: {total_fps / frame_count:.3f}")
 
 
 def update_df(bed_occupied, date_time, df, is_motion, num_detections, frame_count, fps):
@@ -268,13 +277,36 @@ def yolo_output_plotter(background, names, output_data):
                     names[c] if opt.hide_conf else f'{names[c]} {conf:.2f}')
 
                 bed_occupied = plot_one_box_kpt(xyxy, background, label=label, color=colors(c, True),
-                                                line_thickness=opt.line_thickness, kpt_label=True, kpts=keypoints,
-                                                steps=3,
+                                                line_thickness=3, kpt_label=True, kpts=keypoints, steps=3,
                                                 orig_shape=background.shape[:2])
 
     processed_frame = frame.ProcessedFrame(background, True, n, bed_occupied)
 
     return processed_frame
+
+
+def generate_frames_continuously(app):
+    """Helper function to stream frames
+    """
+    while True:
+        if hasattr(app, 'cur_frame'):
+            yield app.cur_frame
+        else:
+            time.sleep(0.1)
+
+
+def create_app():
+    app = Flask(__name__)
+
+    @app.route("/")
+    def index():
+        return render_template("index.html")
+
+    @app.route("/video_feed")
+    def video_feed():
+        return Response(generate_frames_continuously(app), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+    return app
 
 
 def parse_opt():
@@ -289,22 +321,46 @@ def parse_opt():
                         help='define threshold value for difference in pixels for background subtraction')
     parser.add_argument('--yolo-conf', default=0.4, type=float,
                         help='define min confidence level for YOLO model')
-    parser.add_argument('--save-conf', action='store_true',
-                        help='save confidences in --save-txt labels')  # save confidence in txt writing
-    parser.add_argument('--line-thickness', default=3, type=int,
-                        help='bounding box thickness (pixels)')  # box linethickness
     parser.add_argument('--hide-labels', default=False, action='store_true', help='hide labels')  # box hidelabel
     parser.add_argument('--hide-conf', default=False, action='store_true', help='hide confidences')  # boxhideconf
-    opt = parser.parse_args()
-    return opt
+    parser.add_argument("--ip", type=str, required=True, help="ip address of the device")
+    parser.add_argument("--port", type=int, required=True, help="ephemeral port number of the server (1024 to 65535)")
+    options = parser.parse_args()
+    return options
 
 
 # main function
-def main(options):
-    run(**vars(options))
+def main(opt, app):
+    camera = cv2.VideoCapture(int(opt.source))
+    time.sleep(5.0)  # Wait for camera to turn on
+    if not camera.isOpened():  # check if videocapture not opened
+        print('Error while trying to read video. Please check path again')
+        raise SystemExit()
+
+    lock = threading.Lock()
+    t = threading.Thread(target=run, args=[lock, camera, opt.anonymize, opt.device,
+                                           opt.min_area, opt.thresh_val, opt.yolo_conf])
+    t.daemon = True
+    t.start()
+
+    app.run(host=opt.ip, port=opt.port, debug=True, threaded=True, use_reloader=False)
+
+
+def signal_handler(sig, frame):
+    """When control-C is pressed, this function overwrites the default behavior. Update global flag to let all threads
+    know that we want to end the program. Give the program time to exit nicely.
+    """
+    global ctrl_c_pressed
+    ctrl_c_pressed = True
+    time.sleep(2.0)
+    sys.exit(0)
 
 
 if __name__ == "__main__":
     opt = parse_opt()
     strip_optimizer(opt.device)
-    main(opt)
+    app = create_app()
+    ctrl_c_pressed = False
+    signal.signal(signal.SIGINT, signal_handler)
+
+    main(opt, app)
