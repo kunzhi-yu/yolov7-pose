@@ -1,29 +1,27 @@
 import argparse
 import collections
+import signal
+import sys
 import threading
 import time
 from datetime import datetime
-import pandas as pd
-import dlib
 
 import cv2
 import imutils
 import numpy as np
+import pandas as pd
 import torch
 from flask import render_template, Response, Flask
 
 from models.experimental import attempt_load
+from tracking.centroidtracker import CentroidTracker
+from tracking.trackableobject import TrackableObject
 from utils import frame
-from utils.frame import background_sub_frame_prep, yolo_frame_prep
 from utils.datasets import letterbox
+from utils.frame import background_sub_frame_prep, yolo_frame_prep
 from utils.general import non_max_suppression_kpt, strip_optimizer
 from utils.plots import colors, plot_one_box_kpt
 from utils.torch_utils import select_device
-from tracking.trackableobject import TrackableObject
-from tracking.centroidtracker import CentroidTracker
-
-import signal
-import sys
 
 
 @torch.no_grad()
@@ -47,7 +45,7 @@ def run(lock, cap, anonymize=False, device='cpu', min_area=2000, thresh_val=40, 
     frame_count = 0
     total_fps = 0
     # fps = int(cap.get(cv2.CAP_PROP_FPS))
-    fps = 6
+    fps = 3
     starttime = time.monotonic()
 
     # Extract resizing details based of first frame
@@ -69,7 +67,7 @@ def run(lock, cap, anonymize=False, device='cpu', min_area=2000, thresh_val=40, 
     prev_grey_frame = init_background_grey.copy()
 
     # Initialize centroid tracker
-    ct = CentroidTracker(12, 50)
+    ct = CentroidTracker((fps * 3), 50)
     trackers = []  # list of dlib correlation trackers
     trackable_objects = {}  # dict of object_id:TrackableObject
     total_left = 0
@@ -107,7 +105,7 @@ def run(lock, cap, anonymize=False, device='cpu', min_area=2000, thresh_val=40, 
                 # List of bounding rectangles
                 rects = []
 
-                if is_motion and frame_count % 2 == 0:
+                if is_motion:
                     trackers = []
                     # Perform YOLO. Get predictions using model
                     with torch.no_grad():
@@ -125,7 +123,7 @@ def run(lock, cap, anonymize=False, device='cpu', min_area=2000, thresh_val=40, 
 
                     if tracker is not None:
                         trackers.append(tracker)
-                else:
+
                     for tracker in trackers:
                         # update the tracker and grab the updated position
                         tracker.update(processed_frame.get_frame)
@@ -158,10 +156,10 @@ def run(lock, cap, anonymize=False, device='cpu', min_area=2000, thresh_val=40, 
                         obj.centroids.append(centroid)
 
                         if not obj.counted:
-                            if direction < 0 and centroid[0] < resize_width // 2:
+                            if direction < 0 and centroid[0] < resize_width // 3:
                                 total_left += 1
                                 obj.counted = True
-                            elif direction > 0 and centroid[0] > resize_width // 2:
+                            elif direction > 0 and centroid[0] > resize_width // 3:
                                 total_right += 1
                                 obj.counted = True
 
@@ -178,7 +176,8 @@ def run(lock, cap, anonymize=False, device='cpu', min_area=2000, thresh_val=40, 
                                               processed_frame.get_frame,
                                               total_left, total_right)
 
-                cv2.line(processed_frame.get_frame, (resize_width // 2, 0), (resize_width // 2, resize_height), (0, 255, 255), 2)
+                cv2.line(processed_frame.get_frame, (resize_width // 3, 0), (resize_width // 3, resize_height),
+                         (0, 255, 255), 2)
 
                 update_df(processed_frame.get_bed_occupied, date_time, df, is_motion,
                           processed_frame.get_num_detections, total_left, total_right, frame_count, fps)
