@@ -55,7 +55,7 @@ def run(lock, cap, anonymize=False, device='cpu', min_area=2000, thresh_val=40, 
     out = None
 
     # Initialize video buffer for when there is no motion
-    buffer_seconds = 5
+    buffer_seconds = 60
     buffered_frames = collections.deque([], (fps * buffer_seconds))
 
     # Initialize counter for duration since last change
