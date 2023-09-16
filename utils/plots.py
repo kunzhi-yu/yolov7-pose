@@ -8,6 +8,7 @@ from copy import copy
 from pathlib import Path
 
 import cv2
+import dlib
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
@@ -57,7 +58,10 @@ def plot_one_box_kpt(x, im, color=None, label=None, line_thickness=3, kpt_label=
             cv2.putText(im, label, (c1[0], c1[1] - 2), 0, tl / 6, [225, 255, 255], thickness=tf//2, lineType=cv2.LINE_AA)
     if kpt_label:
         bed = plot_skeleton_kpts(im, kpts, steps, orig_shape=orig_shape)
-        return bed
+        tracker = dlib.correlation_tracker()
+        rect = dlib.rectangle(int(x[0]), int(x[1]), int(x[2]), int(x[3]))
+        tracker.start_track(im, rect)
+        return bed, tracker
 
 colors = Colors()  
 

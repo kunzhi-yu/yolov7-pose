@@ -4,6 +4,7 @@ import threading
 import time
 from datetime import datetime
 import pandas as pd
+import dlib
 
 import cv2
 import imutils
@@ -18,6 +19,8 @@ from utils.datasets import letterbox
 from utils.general import non_max_suppression_kpt, strip_optimizer
 from utils.plots import colors, plot_one_box_kpt
 from utils.torch_utils import select_device
+from tracking.trackableobject import TrackableObject
+from tracking.centroidtracker import CentroidTracker
 
 import signal
 import sys
@@ -38,13 +41,13 @@ def run(lock, cap, anonymize=False, device='cpu', min_area=2000, thresh_val=40, 
     names = model.module.names if hasattr(model, 'module') else model.names
 
     # initiate dataframe
-    df = pd.DataFrame(columns=['date', 'time', 'motion', 'yolo_detections', 'bed_occupied'])
+    df = pd.DataFrame(columns=['date', 'time', 'motion', 'yolo_detections', 'bed_occupied', 'total_left', 'total_right'])
 
     # Frame calculations
     frame_count = 0
     total_fps = 0
     # fps = int(cap.get(cv2.CAP_PROP_FPS))
-    fps = 3
+    fps = 6
     starttime = time.monotonic()
 
     # Extract resizing details based of first frame
@@ -55,7 +58,7 @@ def run(lock, cap, anonymize=False, device='cpu', min_area=2000, thresh_val=40, 
     out = None
 
     # Initialize video buffer for when there is no motion
-    buffer_seconds = 5
+    buffer_seconds = 60
     buffered_frames = collections.deque([], (fps * buffer_seconds))
 
     # Initialize counter for duration since last change
@@ -64,6 +67,13 @@ def run(lock, cap, anonymize=False, device='cpu', min_area=2000, thresh_val=40, 
     # Initialize background subtraction by storing first frame to compare
     init_background_grey = background_sub_frame_prep(init_background)
     prev_grey_frame = init_background_grey.copy()
+
+    # Initialize centroid tracker
+    ct = CentroidTracker(12, 50)
+    trackers = []  # list of dlib correlation trackers
+    trackable_objects = {}  # dict of object_id:TrackableObject
+    total_left = 0
+    total_right = 0
 
     try:
         while cap.isOpened:
@@ -94,7 +104,11 @@ def run(lock, cap, anonymize=False, device='cpu', min_area=2000, thresh_val=40, 
                                                                    prev_grey_frame, static_count, im0)
                 is_motion = processed_frame.get_is_motion
 
-                if is_motion:
+                # List of bounding rectangles
+                rects = []
+
+                if is_motion and frame_count % 2 == 0:
+                    trackers = []
                     # Perform YOLO. Get predictions using model
                     with torch.no_grad():
                         output_data, _ = model(curr_frame)
@@ -107,14 +121,67 @@ def run(lock, cap, anonymize=False, device='cpu', min_area=2000, thresh_val=40, 
                                                           kpt_label=True)
 
                     # Place the model outputs onto a frame
-                    processed_frame = yolo_output_plotter(processed_frame.get_frame, names, output_data)
+                    processed_frame, tracker = yolo_output_plotter(processed_frame.get_frame, names, output_data)
+
+                    if tracker is not None:
+                        trackers.append(tracker)
+                else:
+                    for tracker in trackers:
+                        # update the tracker and grab the updated position
+                        tracker.update(processed_frame.get_frame)
+                        pos = tracker.get_position()
+
+                        # Unpack the position object
+                        start_x = int(pos.left())
+                        start_y = int(pos.top())
+                        end_x = int(pos.right())
+                        end_y = int(pos.bottom())
+
+                        rects.append((start_x, start_y, end_x, end_y))
+
+                # Associate old object centroids with new object centroids
+                objects = ct.update(rects)
+
+                for (object_id, centroid) in objects.items():
+                    # check if a trackable object exists for the current object_id
+                    obj = trackable_objects.get(object_id, None)
+
+                    # If there is no existing object, create it
+                    if obj is None:
+                        obj = TrackableObject(object_id, centroid)
+                    else:
+                        # the difference between the y-coordinate of the *current* centroid and the mean of *previous*
+                        # centroids will tell us in which direction the object is moving (negative for 'up' and positive
+                        # for 'down')
+                        x = [c[0] for c in obj.centroids]
+                        direction = centroid[0] - np.mean(x)
+                        obj.centroids.append(centroid)
+
+                        if not obj.counted:
+                            if direction < 0 and centroid[0] < resize_width // 2:
+                                total_left += 1
+                                obj.counted = True
+                            elif direction > 0 and centroid[0] > resize_width // 2:
+                                total_right += 1
+                                obj.counted = True
+
+                    # Store trackable object in our dictionary
+                    trackable_objects[object_id] = obj
+
+                    id_text = "ID {}".format(object_id)
+                    cv2.putText(processed_frame.get_frame, id_text, (centroid[0] - 10, centroid[1] - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                    cv2.circle(processed_frame.get_frame, (centroid[0], centroid[1]), 4, (0, 255, 0), -1)
 
                 date_time = place_txt_results(processed_frame.get_bed_occupied, is_motion,
                                               processed_frame.get_num_detections,
-                                              processed_frame.get_frame)
+                                              processed_frame.get_frame,
+                                              total_left, total_right)
+
+                cv2.line(processed_frame.get_frame, (resize_width // 2, 0), (resize_width // 2, resize_height), (0, 255, 255), 2)
 
                 update_df(processed_frame.get_bed_occupied, date_time, df, is_motion,
-                          processed_frame.get_num_detections, frame_count, fps)
+                          processed_frame.get_num_detections, total_left, total_right, frame_count, fps)
 
                 # Figure out how to save the frame based off buffer
                 buffer_lst = list(buffered_frames)
@@ -175,16 +242,17 @@ def finish_video_df(cap, df, frame_count, out, total_fps):
     print(f"Average FPS: {total_fps / frame_count:.3f}")
 
 
-def update_df(bed_occupied, date_time, df, is_motion, num_detections, frame_count, fps):
+def update_df(bed_occupied, date_time, df, is_motion, num_detections, total_left, total_right, frame_count, fps):
     """Updates the dataframe df with details from the current frame
     """
     if frame_count % int(fps) == 0:
         new_row = {'date': date_time.strftime("%Y-%m-%d"), 'time': date_time.strftime("%H:%M:%S"), 'motion': is_motion,
-                   'yolo_detections': int(num_detections), 'bed_occupied': bool(bed_occupied)}
+                   'yolo_detections': int(num_detections), 'bed_occupied': bool(bed_occupied),
+                   'total_left': int(total_left), 'total_right': int(total_right)}
         df.loc[len(df)] = new_row
 
 
-def place_txt_results(bed_occupied, is_motion, num_detections, processed_frame):
+def place_txt_results(bed_occupied, is_motion, num_detections, processed_frame, total_left, total_right):
     """Places the text of the results onto the processed frame.
     """
     cv2.putText(processed_frame, "Motion: {}".format(is_motion), (10, 40),
@@ -192,6 +260,10 @@ def place_txt_results(bed_occupied, is_motion, num_detections, processed_frame):
     cv2.putText(processed_frame, "YOLO detections: {}".format(num_detections), (10, 60),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
     cv2.putText(processed_frame, "Bed occupied: {}".format(bed_occupied), (10, 80),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    cv2.putText(processed_frame, "Total left: {}".format(total_left), (10, 100),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    cv2.putText(processed_frame, "Total right: {}".format(total_right), (10, 120),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
     # put timestamp
@@ -262,6 +334,7 @@ def yolo_output_plotter(background, names, output_data):
     # if there are no poses, then there is no one on the bed
     bed_occupied = False
     n = 0
+    tracker = None
 
     for i, pose in enumerate(output_data):  # detections per image
         if len(output_data) and len(pose[:, 5].unique()) != 0:  # check if no pose
@@ -276,13 +349,13 @@ def yolo_output_plotter(background, names, output_data):
                 label = None if opt.hide_labels else (
                     names[c] if opt.hide_conf else f'{names[c]} {conf:.2f}')
 
-                bed_occupied = plot_one_box_kpt(xyxy, background, label=label, color=colors(c, True),
+                bed_occupied, tracker = plot_one_box_kpt(xyxy, background, label=label, color=colors(c, True),
                                                 line_thickness=3, kpt_label=True, kpts=keypoints, steps=3,
                                                 orig_shape=background.shape[:2])
 
     processed_frame = frame.ProcessedFrame(background, True, n, bed_occupied)
 
-    return processed_frame
+    return processed_frame, tracker
 
 
 def generate_frames_continuously(app):
