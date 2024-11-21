@@ -53,11 +53,8 @@ def run(lock, cap, anonymize=False, device='cpu', min_area=2000, thresh_val=40, 
     resize_height, resize_width = init_background.shape[:2]
 
     # Initialize video writer
-    out = None
-
-    # Initialize video buffer for when there is no motion
-    buffer_seconds = 60
-    buffered_frames = collections.deque([], (fps * buffer_seconds))
+    out = cv2.VideoWriter(f"output_videos/{starttime}.mp4",
+                                          cv2.VideoWriter_fourcc(*'mp4v'), fps, (resize_width, resize_height))
 
     # Initialize counter for duration since last change
     static_count = 0
@@ -105,7 +102,7 @@ def run(lock, cap, anonymize=False, device='cpu', min_area=2000, thresh_val=40, 
                 # List of bounding rectangles
                 rects = []
 
-                if is_motion:
+                if True:
                     trackers = []
                     # Perform YOLO. Get predictions using model
                     with torch.no_grad():
@@ -181,21 +178,8 @@ def run(lock, cap, anonymize=False, device='cpu', min_area=2000, thresh_val=40, 
 
                 update_df(processed_frame.get_bed_occupied, date_time, df, is_motion,
                           processed_frame.get_num_detections, total_left, total_right, frame_count, fps)
-
-                # Figure out how to save the frame based off buffer
-                buffer_lst = list(buffered_frames)
-                is_motion_lst = [f.get_is_motion for f in buffer_lst]
-                curr_time = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
-                if not any(is_motion_lst) and is_motion:
-                    out = cv2.VideoWriter(f"output_videos/{curr_time}.mp4",
-                                          cv2.VideoWriter_fourcc(*'mp4v'), fps, (resize_width, resize_height))
-                    for f in buffer_lst:
-                        out.write(f.get_frame)
-                    out.write(processed_frame.get_frame)
-                elif any(is_motion_lst) and out is not None:
-                    out.write(processed_frame.get_frame)
-                elif not any(is_motion_lst) and not is_motion and out is not None:
-                    out.release()
+                
+                out.write(processed_frame.get_frame)
 
                 # backup csv file every ~5 minutes
                 if (frame_count + 1) % (300 * fps) == 0:
@@ -211,9 +195,6 @@ def run(lock, cap, anonymize=False, device='cpu', min_area=2000, thresh_val=40, 
                 (flag, encodedImage) = cv2.imencode(".jpg", processed_frame.get_frame)
                 if not flag:
                     continue
-
-                # update buffer
-                buffered_frames.append(processed_frame)
 
                 # update the previous frame
                 prev_grey_frame = curr_grey_frame
@@ -234,10 +215,11 @@ def run(lock, cap, anonymize=False, device='cpu', min_area=2000, thresh_val=40, 
 def finish_video_df(cap, df, frame_count, out, total_fps):
     """Releases resources and saves any running video and csv files.
     """
-    cap.release()
-    out.release()
+    # Release the .csv file first in case the video file is corrupted and stops the code.
     curr_time = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
     df.to_csv(f"output_videos/{curr_time}.csv", index=False)
+    cap.release()
+    out.release()
     print(f"Average FPS: {total_fps / frame_count:.3f}")
 
 
@@ -403,7 +385,7 @@ def parse_opt():
 
 # main function
 def main(opt, app):
-    camera = cv2.VideoCapture(int(opt.source))
+    camera = cv2.VideoCapture(opt.source)
     time.sleep(5.0)  # Wait for camera to turn on
     if not camera.isOpened():  # check if videocapture not opened
         print('Error while trying to read video. Please check path again')
