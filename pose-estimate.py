@@ -164,18 +164,10 @@ def run(lock, cap, anonymize=False, device='cpu', min_area=2000, thresh_val=40, 
                     # Store trackable object in our dictionary
                     trackable_objects[object_id] = obj
 
-                    id_text = "ID {}".format(object_id)
-                    cv2.putText(processed_frame.get_frame, id_text, (centroid[0] - 10, centroid[1] - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                    cv2.circle(processed_frame.get_frame, (centroid[0], centroid[1]), 4, (0, 255, 0), -1)
-
                 date_time = place_txt_results(processed_frame.get_bed_occupied, is_motion,
                                               processed_frame.get_num_detections,
                                               processed_frame.get_frame,
                                               total_left, total_right)
-
-                cv2.line(processed_frame.get_frame, (resize_width // 3, 0), (resize_width // 3, resize_height),
-                         (0, 255, 255), 2)
 
                 update_df(processed_frame.get_bed_occupied, date_time, df, is_motion,
                           processed_frame.get_num_detections, total_left, total_right, frame_count, fps)
@@ -321,6 +313,11 @@ def yolo_output_plotter(background, names, output_data):
     n = 0
     tracker = None
 
+    # Define parallelogram points for the bed
+    # The order of the array is TL, TR, BR, BL
+    bed_points = np.array([[272, 75], [321, 75], [405, 165], [326, 165]], dtype=np.int32)
+    cv2.polylines(background, [bed_points], isClosed=True, color=(0, 0, 255), thickness=2)
+
     for i, pose in enumerate(output_data):  # detections per image
         if len(output_data) and len(pose[:, 5].unique()) != 0:  # check if no pose
             for c in pose[:, 5].unique():  # Print results
@@ -333,10 +330,21 @@ def yolo_output_plotter(background, names, output_data):
                 keypoints = pose[det_index, 6:]
                 label = None if opt.hide_labels else (
                     names[c] if opt.hide_conf else f'{names[c]} {conf:.2f}')
+                
+                # Calculate centre coordinates of the bounding box
+                x1, y1, x2, y2 = xyxy
+                center_x = int((x1 + x2) / 2)
+                center_y = int((y1 + y2) / 2)
+
+                cv2.circle(background, (center_x, center_y), 5, (0, 0, 255), -1)  # Draw center point
 
                 bed_occupied, tracker = plot_one_box_kpt(xyxy, background, label=label, color=colors(c, True),
                                                 line_thickness=3, kpt_label=True, kpts=keypoints, steps=3,
                                                 orig_shape=background.shape[:2])
+                
+                # Check if the center point is inside the parallelogram
+                if cv2.pointPolygonTest(bed_points, (center_x, center_y), False) >= 0:
+                    bed_occupied = True
 
     processed_frame = frame.ProcessedFrame(background, True, n, bed_occupied)
 
