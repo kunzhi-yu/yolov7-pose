@@ -53,7 +53,8 @@ def run(lock, cap, anonymize=False, device='cpu', min_area=2000, thresh_val=40, 
     resize_height, resize_width = init_background.shape[:2]
 
     # Initialize video writer
-    out = cv2.VideoWriter(f"output_videos/{starttime}.mp4",
+    vid_start_time = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
+    out = cv2.VideoWriter(f"output_videos/{vid_start_time}.mp4",
                                           cv2.VideoWriter_fourcc(*'mp4v'), fps, (resize_width, resize_height))
 
     # Initialize counter for duration since last change
@@ -181,16 +182,18 @@ def run(lock, cap, anonymize=False, device='cpu', min_area=2000, thresh_val=40, 
                 
                 out.write(processed_frame.get_frame)
 
-                # backup csv file every ~5 minutes
+                # backup csv file every ~5 minutes 
                 if (frame_count + 1) % (300 * fps) == 0:
                     df.to_csv(f"output_videos/backup.csv", index=False)
                     print("Back up CSV")
-                    # break videos into 30 minute pieces
-                    if frame_count % (1800 * fps) == 0 and out is not None:
-                        out.release()
-                        out = cv2.VideoWriter(f"output_videos/{curr_time}.mp4",
+                # break videos into 30 minute pieces
+                # 1800 = 30 min
+                if frame_count != 0 and frame_count % (900 * fps) == 0 and out is not None:
+                    out.release()
+                    curr_time = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
+                    out = cv2.VideoWriter(f"output_videos/{curr_time}.mp4",
                                               cv2.VideoWriter_fourcc(*'mp4v'), fps, (resize_width, resize_height))
-                        print("Back up Video")
+                    print("Back up Video")
 
                 (flag, encodedImage) = cv2.imencode(".jpg", processed_frame.get_frame)
                 if not flag:
@@ -226,7 +229,8 @@ def finish_video_df(cap, df, frame_count, out, total_fps):
 def update_df(bed_occupied, date_time, df, is_motion, num_detections, total_left, total_right, frame_count, fps):
     """Updates the dataframe df with details from the current frame
     """
-    if frame_count % int(fps) == 0:
+    # if frame_count % (int(fps) / 2) == 0:
+    if True:
         new_row = {'date': date_time.strftime("%Y-%m-%d"), 'time': date_time.strftime("%H:%M:%S"), 'motion': is_motion,
                    'yolo_detections': int(num_detections), 'bed_occupied': bool(bed_occupied),
                    'total_left': int(total_left), 'total_right': int(total_right)}
